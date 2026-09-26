@@ -14,6 +14,10 @@ Strategy:
      the zone (fires on the latest completed 5m candle only, so alerts
      are timely rather than historical).
 
+Also sends a "Scanner alive" heartbeat message every run, summarizing
+each pair's active structure zones, 1H trend, and session status, so
+you know the bot is running even when nothing fires.
+
 Setup:
   - GitHub repo secrets required: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
   - Runs on a schedule via GitHub Actions (see structure_scanner.yml)
@@ -55,6 +59,7 @@ MAX_OVERLAP = 0.30
 RECENT_1H_CANDLES = 12   # how far back to look for a fresh 1H engulf
 RETEST_MAX_BARS_5M = 48  # how many 5m bars to allow for the retest to form
 DRIFT_GATE_R = 0.35      # skip alert if live price has moved this many R from entry
+TREND_EMA_SPAN = 50      # 1H EMA span used for the heartbeat trend tag
 
 STATE_PATH = "state/alerted.json"
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -128,6 +133,32 @@ def structure_score(df, i, direction):
     return sum(checks.values())
 
 
+def get_1h_trend(df_1h):
+    """Simple EMA-based trend tag for the heartbeat message."""
+    span = min(TREND_EMA_SPAN, max(len(df_1h) - 1, 2))
+    ema = df_1h["Close"].ewm(span=span).mean()
+    return "up" if df_1h["Close"].iloc[-1] > ema.iloc[-1] else "down"
+
+
+def count_active_zones(df_1h):
+    """Number of qualifying (score >= MIN_SCORE) 1H engulfs in the recent
+    lookback window, i.e. zones currently being watched for a retest."""
+    count = 0
+    start_i = max(1, len(df_1h) - RECENT_1H_CANDLES)
+    for i in range(start_i, len(df_1h)):
+        prev, cur = df_1h.iloc[i - 1], df_1h.iloc[i]
+        direction = None
+        if is_bull_engulf(prev, cur):
+            direction = "bull"
+        elif is_bear_engulf(prev, cur):
+            direction = "bear"
+        if direction is None:
+            continue
+        if structure_score(df_1h, i, direction) >= MIN_SCORE:
+            count += 1
+    return count
+
+
 # ---------------------------------------------------------------------------
 # STATE (dedup across runs)
 # ---------------------------------------------------------------------------
@@ -166,16 +197,25 @@ def send_telegram(message):
 # SCAN LOGIC
 # ---------------------------------------------------------------------------
 
-def scan_pair(name, ticker, alerted):
+def scan_pair(name, ticker, alerted, stats):
+    """Scans one pair for alertable setups, and returns its heartbeat info
+    (independent of whether an alert fired)."""
     df_1h = _flatten(yf.download(ticker, period="14d", interval="1h", progress=False))
     df_5m = _flatten(yf.download(ticker, period="5d", interval="5m", progress=False))
     if df_1h.empty or df_5m.empty or len(df_1h) < LOOKBACK_LEGS + 2:
         print(f"[{name}] insufficient data, skipping")
-        return
+        return {"name": name, "status": "no data"}
 
     live_price = df_5m["Close"].iloc[-1]
     now_utc = datetime.now(timezone.utc)
     in_session = 7 <= now_utc.hour < 20
+
+    heartbeat = {
+        "name": name,
+        "zones": count_active_zones(df_1h),
+        "trend": get_1h_trend(df_1h),
+        "in_session": in_session,
+    }
 
     # look at the most recent 1H candles for a fresh engulf
     start_i = max(1, len(df_1h) - RECENT_1H_CANDLES)
@@ -260,17 +300,44 @@ def scan_pair(name, ticker, alerted):
         print(f"[{name}] ALERT — {arrow} score {score}/6")
         send_telegram(message)
         alerted.add(key)
+        stats["signals"] += 1
+
+    return heartbeat
+
+
+# ---------------------------------------------------------------------------
+# HEARTBEAT
+# ---------------------------------------------------------------------------
+
+def format_heartbeat_line(info):
+    if "status" in info:
+        return f"{info['name']}: {info['status']}"
+    session_tag = "in-session" if info["in_session"] else "off-session"
+    return f"{info['name']}: {info['zones']} zones, 1H trend {info['trend']}, {session_tag}"
+
+
+def send_heartbeat(heartbeats, signal_count):
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [f"Scanner alive {now_str}. Signals: {signal_count}"]
+    lines += [format_heartbeat_line(h) for h in heartbeats]
+    send_telegram("\n".join(lines))
 
 
 def main():
     alerted = load_state()
+    stats = {"signals": 0}
+    heartbeats = []
     for name, ticker in PAIRS.items():
         try:
-            scan_pair(name, ticker, alerted)
+            info = scan_pair(name, ticker, alerted, stats)
         except Exception as e:
             print(f"[{name}] error: {e}")
+            info = {"name": name, "status": "error"}
+        heartbeats.append(info)
     save_state(alerted)
+    send_heartbeat(heartbeats, stats["signals"])
 
 
 if __name__ == "__main__":
     main()
+              
