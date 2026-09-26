@@ -3,26 +3,25 @@ Structure Engulf Scanner Bot
 =============================
 Live version of the 1H engulf + 5m retest strategy validated in backtesting
 (structure_engulf_backtest.py). Scans the 10 pairs that showed net-positive
-expectancy, and sends a Telegram alert when a fresh, high-quality setup
-triggers.
+expectancy, and sends a Telegram alert (with a per-rule checklist) when a
+fresh, high-quality setup triggers.
 
-Strategy:
-  1. Find a 1H engulfing candle.
-  2. Score the leg into it for cleanliness (0-6). Only act on MIN_SCORE+.
-  3. Watch for price to retrace into that 1H candle's zone.
-  4. Alert when a same-direction engulfing candle forms on the 5m inside
-     the zone (fires on the latest completed 5m candle only, so alerts
-     are timely rather than historical).
-
-Also sends a "Scanner alive" heartbeat message every run, summarizing
-each pair's active structure zones, 1H trend, and session status, so
-you know the bot is running even when nothing fires.
+Also:
+  - Sends a "Scanner alive" heartbeat every run.
+  - Polls for Telegram commands once per run (fits the existing scheduled
+    GitHub Actions cadence rather than needing an always-on process):
+      /calc <account> <risk%> <entry> <stop> [contract_size]  — position
+        size calculator. Without a contract size it returns raw units;
+        with one (e.g. your broker's oz/lot or barrels/lot) it returns
+        lots directly.
+      /help — command list
 
 Setup:
   - GitHub repo secrets required: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
   - Runs on a schedule via GitHub Actions (see structure_scanner.yml)
-  - Keeps state/alerted.json to avoid sending the same setup twice;
-    the workflow commits this file back to the repo after each run.
+  - Keeps state/alerted.json (dedup) and state/last_update_id.json
+    (command polling offset); the workflow commits these back to the
+    repo after each run.
 """
 
 import os
@@ -62,8 +61,32 @@ DRIFT_GATE_R = 0.35      # skip alert if live price has moved this many R from e
 TREND_EMA_SPAN = 50      # 1H EMA span used for the heartbeat trend tag
 
 STATE_PATH = "state/alerted.json"
+UPDATE_ID_PATH = "state/last_update_id.json"
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+CHECK_LABELS = {
+    "body_ratio": "Strong candle bodies",
+    "consolidation": "Tight consolidation",
+    "low_overlap": "Low candle overlap",
+    "swing_clarity": "Clear swing structure",
+    "strong_engulf": "Strong engulf candle",
+    "clean_leg_low": "Clean leg extreme",
+}
+
+HELP_TEXT = (
+    "*Azu Engulf Bot*\n"
+    "Scans USOIL, XAUUSD, GER40, US30, US100, US500, JP225, BTCUSDT, "
+    "SOLUSDT, BNBUSDT for 1H engulf + 5m retest structure setups.\n\n"
+    "*Commands*\n"
+    "/calc <account> <risk%> <entry> <stop> [contract_size] — position "
+    "size calculator. Example: /calc $2500 0.5% 1985.50 1980.00 100\n"
+    "Add your broker's contract size (e.g. oz per lot, barrels per lot) "
+    "as the 5th number to get lots directly.\n"
+    "/help — this message\n\n"
+    "_Commands are checked once per scan run, so replies can take up to "
+    "the scan interval to arrive._"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -90,13 +113,16 @@ def is_bear_engulf(prev, cur):
             and cur["Open"] >= prev["Close"] and cur["Close"] <= prev["Open"])
 
 
-def structure_score(df, i, direction):
+def get_structure_checks(df, i, direction):
+    """Returns an ordered dict of rule_name -> bool for the leg into
+    candle i, so the alert can show a per-rule checklist rather than
+    just a bare score."""
     start = max(0, i - LOOKBACK_LEGS)
     leg = df.iloc[start:i + 1]
-    if len(leg) < 3:
-        return 0
-
     checks = {}
+    if len(leg) < 3:
+        return {k: False for k in CHECK_LABELS}
+
     body_ratios = [body(c) / rng(c) for _, c in leg.iterrows()]
     checks["body_ratio"] = np.mean(body_ratios) >= MIN_BODY_RATIO
 
@@ -130,7 +156,17 @@ def structure_score(df, i, direction):
     else:
         checks["clean_leg_low"] = df.iloc[i]["High"] <= pre_engulf["High"].max()
 
-    return sum(checks.values())
+    return checks
+
+
+def structure_score(df, i, direction):
+    return sum(get_structure_checks(df, i, direction).values())
+
+
+def format_checklist(checks):
+    return "\n".join(
+        f"{CHECK_LABELS.get(k, k)} {'✅' if v else '❌'}" for k, v in checks.items()
+    )
 
 
 def get_1h_trend(df_1h):
@@ -174,6 +210,17 @@ def save_state(alerted):
     with open(STATE_PATH, "w") as f:
         json.dump(sorted(alerted), f, indent=2)
 
+def get_last_update_id():
+    if os.path.exists(UPDATE_ID_PATH):
+        with open(UPDATE_ID_PATH) as f:
+            return json.load(f).get("update_id", 0)
+    return 0
+
+def save_last_update_id(update_id):
+    os.makedirs(os.path.dirname(UPDATE_ID_PATH), exist_ok=True)
+    with open(UPDATE_ID_PATH, "w") as f:
+        json.dump({"update_id": update_id}, f)
+
 
 # ---------------------------------------------------------------------------
 # TELEGRAM
@@ -191,6 +238,91 @@ def send_telegram(message):
     }, timeout=10)
     if resp.status_code != 200:
         print(f"Telegram send failed: {resp.status_code} {resp.text}")
+
+
+def _clean_number(s):
+    """Strips $, %, and thousands commas so /calc accepts either
+    '2500' or '$2,500', and either '0.5' or '0.5%'."""
+    return float(s.replace("$", "").replace("%", "").replace(",", ""))
+
+
+def handle_calc_command(text):
+    parts = text.strip().split()
+    try:
+        account = _clean_number(parts[1])
+        risk_pct = _clean_number(parts[2])
+        entry = _clean_number(parts[3])
+        stop = _clean_number(parts[4])
+        contract_size = _clean_number(parts[5]) if len(parts) > 5 else None
+    except (IndexError, ValueError):
+        return (
+            "Usage: /calc <account> <risk%> <entry> <stop> [contract_size]\n"
+            "Example: /calc $2500 0.5% 95.75 95.40\n"
+            "With lot sizing: /calc $2500 0.5% 1985.50 1980.00 100  (e.g. 100 oz/lot)"
+        )
+
+    distance = abs(entry - stop)
+    if distance == 0:
+        return "Entry and stop can't be equal."
+
+    risk_amount = account * risk_pct / 100
+    units = risk_amount / distance
+
+    lines = [
+        "*Risk Calculator*",
+        f"Account: ${account:,.2f}",
+        f"Risk: {risk_pct}% (${risk_amount:,.2f})",
+        f"Entry: {entry}",
+        f"Stop: {stop}",
+        f"Distance: {distance:.5f}",
+        f"Position size: {units:,.2f} units",
+    ]
+    if contract_size:
+        lots = units / contract_size
+        lines.append(f"Contract size: {contract_size}")
+        lines.append(f"Lots: {lots:.3f}")
+    else:
+        lines.append(
+            "_Add your broker's contract size as a 5th number to get lots "
+            "directly, e.g. /calc 2500 0.5 95.75 95.40 1000_"
+        )
+    return "\n".join(lines)
+
+
+def poll_commands():
+    """Checks for new Telegram messages once per run and replies to
+    recognized commands. Only responds in the configured chat."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    last_id = get_last_update_id()
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    try:
+        resp = requests.get(url, params={"offset": last_id + 1, "timeout": 0}, timeout=10)
+        data = resp.json()
+    except Exception as e:
+        print(f"getUpdates failed: {e}")
+        return
+    if not data.get("ok"):
+        print(f"getUpdates error: {data}")
+        return
+
+    max_id = last_id
+    for upd in data.get("result", []):
+        max_id = max(max_id, upd["update_id"])
+        msg = upd.get("message") or upd.get("edited_message")
+        if not msg:
+            continue
+        chat_id = str(msg.get("chat", {}).get("id"))
+        if chat_id != str(TELEGRAM_CHAT_ID):
+            continue  # ignore commands from anyone but the configured chat
+        text = msg.get("text", "").strip()
+        if text.startswith("/calc"):
+            send_telegram(handle_calc_command(text))
+        elif text.startswith("/start") or text.startswith("/help"):
+            send_telegram(HELP_TEXT)
+
+    if data.get("result"):
+        save_last_update_id(max_id)
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +349,6 @@ def scan_pair(name, ticker, alerted, stats):
         "in_session": in_session,
     }
 
-    # look at the most recent 1H candles for a fresh engulf
     start_i = max(1, len(df_1h) - RECENT_1H_CANDLES)
     for i in range(start_i, len(df_1h)):
         prev, cur = df_1h.iloc[i - 1], df_1h.iloc[i]
@@ -229,14 +360,14 @@ def scan_pair(name, ticker, alerted, stats):
         if direction is None:
             continue
 
-        score = structure_score(df_1h, i, direction)
+        checks = get_structure_checks(df_1h, i, direction)
+        score = sum(checks.values())
         if score < MIN_SCORE:
             continue
 
         zone_low, zone_high = cur["Low"], cur["High"]
         engulf_time = df_1h.index[i]
 
-        # look for the retest + 5m engulf entry, most recent 5m candle only
         window = df_5m[df_5m.index > engulf_time].iloc[:RETEST_MAX_BARS_5M]
         if len(window) < 2:
             continue
@@ -264,7 +395,6 @@ def scan_pair(name, ticker, alerted, stats):
             continue
 
         entry_time = entry_candle.name
-        # only alert if the entry trigger is the LATEST completed 5m candle
         if entry_time != df_5m.index[-1]:
             continue
 
@@ -289,13 +419,18 @@ def scan_pair(name, ticker, alerted, stats):
         arrow = "🟢 BUY" if direction == "bull" else "🔴 SELL"
         message = (
             f"*{arrow} — {name}*\n"
-            f"Structure Engulf | Score {score}/6 | {session_tag}\n\n"
+            f"Structure Engulf | {session_tag}\n\n"
+            f"{format_checklist(checks)}\n"
+            f"Retest tapped ✅\n"
+            f"5m confirmation ✅\n"
+            f"Score: {score}/6\n\n"
             f"Entry: `{entry:.5f}`\n"
             f"Stop: `{stop:.5f}`\n"
             f"Target ({TARGET_R}R): `{target:.5f}`\n"
             f"Live: `{live_price:.5f}`\n\n"
             f"1H zone: {zone_low:.5f} - {zone_high:.5f}\n"
-            f"Engulf: {engulf_time} UTC"
+            f"Engulf: {engulf_time} UTC\n\n"
+            f"_Reply /calc <account> <risk%> {entry:.5f} {stop:.5f} to size this trade._"
         )
         print(f"[{name}] ALERT — {arrow} score {score}/6")
         send_telegram(message)
@@ -336,8 +471,9 @@ def main():
         heartbeats.append(info)
     save_state(alerted)
     send_heartbeat(heartbeats, stats["signals"])
+    poll_commands()
 
 
 if __name__ == "__main__":
     main()
-              
+  
