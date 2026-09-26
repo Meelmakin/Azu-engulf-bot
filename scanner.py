@@ -26,6 +26,7 @@ Setup:
 
 import os
 import json
+import csv
 import requests
 import pandas as pd
 import numpy as np
@@ -62,6 +63,12 @@ TREND_EMA_SPAN = 50      # 1H EMA span used for the heartbeat trend tag
 
 STATE_PATH = "state/alerted.json"
 UPDATE_ID_PATH = "state/last_update_id.json"
+JOURNAL_PATH = "state/journal.csv"
+SUMMARY_STATE_PATH = "state/last_summary.json"
+JOURNAL_FIELDS = ["id", "logged_at", "pair", "direction", "score", "entry",
+                   "stop", "target", "session", "outcome", "actual_r"]
+DAILY_SUMMARY_HOUR = 21   # ~9pm UTC, after most sessions close
+WEEKLY_SUMMARY_WEEKDAY = 6  # Sunday (Monday=0 .. Sunday=6)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -83,7 +90,13 @@ HELP_TEXT = (
     "size calculator. Example: /calc $2500 0.5% 1985.50 1980.00 100\n"
     "Add your broker's contract size (e.g. oz per lot, barrels per lot) "
     "as the 5th number to get lots directly.\n"
+    "/outcome <pair> <win|loss|be> [actual_r] — record how a trade went. "
+    "Updates your most recent open trade for that pair. Example: "
+    "/outcome XAUUSD win  or  /outcome XAUUSD loss -1\n"
     "/help — this message\n\n"
+    "Every alert is auto-logged to the journal as \"open\" until you record "
+    "an outcome. Daily and weekly summaries (win rate, avg R) post "
+    "automatically around 21:00 UTC.\n\n"
     "_Commands are checked once per scan run, so replies can take up to "
     "the scan interval to arrive._"
 )
@@ -223,6 +236,151 @@ def save_last_update_id(update_id):
 
 
 # ---------------------------------------------------------------------------
+# JOURNAL
+# ---------------------------------------------------------------------------
+
+def log_trade(name, direction, score, entry, stop, target, session_tag, engulf_time, entry_time):
+    trade_id = f"{name}_{direction}_{engulf_time.isoformat()}_{entry_time.isoformat()}"
+    os.makedirs(os.path.dirname(JOURNAL_PATH), exist_ok=True)
+    is_new = not os.path.exists(JOURNAL_PATH)
+    with open(JOURNAL_PATH, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=JOURNAL_FIELDS)
+        if is_new:
+            writer.writeheader()
+        writer.writerow({
+            "id": trade_id,
+            "logged_at": datetime.now(timezone.utc).isoformat(),
+            "pair": name,
+            "direction": direction,
+            "score": score,
+            "entry": entry,
+            "stop": stop,
+            "target": target,
+            "session": session_tag,
+            "outcome": "open",
+            "actual_r": "",
+        })
+
+
+def load_journal():
+    if not os.path.exists(JOURNAL_PATH):
+        return []
+    with open(JOURNAL_PATH, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def save_journal(rows):
+    os.makedirs(os.path.dirname(JOURNAL_PATH), exist_ok=True)
+    with open(JOURNAL_PATH, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=JOURNAL_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def handle_outcome_command(text):
+    parts = text.strip().split()
+    if len(parts) < 3:
+        return (
+            "Usage: /outcome <pair> <win|loss|be> [actual_r]\n"
+            "Example: /outcome XAUUSD win\n"
+            "Example: /outcome XAUUSD loss -1\n"
+            "Updates your most recent open trade for that pair."
+        )
+    pair = parts[1].upper()
+    result = parts[2].lower()
+    if result not in ("win", "loss", "be"):
+        return "Result must be win, loss, or be."
+    try:
+        actual_r = _clean_number(parts[3]) if len(parts) > 3 else None
+    except ValueError:
+        return "actual_r must be a number, e.g. /outcome XAUUSD win 2.8"
+
+    rows = load_journal()
+    for row in reversed(rows):
+        if row["pair"] == pair and row["outcome"] == "open":
+            row["outcome"] = result
+            row["actual_r"] = actual_r if actual_r is not None else {"win": TARGET_R, "loss": -1, "be": 0}[result]
+            save_journal(rows)
+            return f"Updated {pair} trade ({row['id']}) → {result}, {row['actual_r']}R"
+    return f"No open trade found for {pair}."
+
+
+def within_days(row, days, now):
+    try:
+        ts = datetime.fromisoformat(row["logged_at"])
+    except (KeyError, ValueError):
+        return False
+    return (now - ts).days < days
+
+
+def compute_stats(rows):
+    closed = [r for r in rows if r["outcome"] in ("win", "loss", "be")]
+    if not closed:
+        return None
+    wins = sum(1 for r in closed if r["outcome"] == "win")
+    total_r = sum(float(r["actual_r"]) for r in closed if r["actual_r"] not in ("", None))
+    return {
+        "count": len(closed),
+        "wins": wins,
+        "win_rate": wins / len(closed) * 100,
+        "avg_r": total_r / len(closed),
+        "total_r": total_r,
+    }
+
+
+def format_stats_message(title, rows):
+    stats = compute_stats(rows)
+    open_count = sum(1 for r in rows if r["outcome"] == "open")
+    if not stats:
+        return f"*{title}*\nNo closed trades yet. {open_count} still open."
+    return (
+        f"*{title}*\n"
+        f"Closed trades: {stats['count']} ({stats['wins']} wins, {stats['win_rate']:.0f}% win rate)\n"
+        f"Avg R: {stats['avg_r']:.2f} | Total R: {stats['total_r']:.2f}\n"
+        f"Still open: {open_count}"
+    )
+
+
+def get_summary_state():
+    if os.path.exists(SUMMARY_STATE_PATH):
+        with open(SUMMARY_STATE_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def save_summary_state(state):
+    os.makedirs(os.path.dirname(SUMMARY_STATE_PATH), exist_ok=True)
+    with open(SUMMARY_STATE_PATH, "w") as f:
+        json.dump(state, f)
+
+
+def maybe_send_summaries():
+    """Sends a daily summary once per day and a weekly summary once per
+    week, both around DAILY_SUMMARY_HOUR UTC. Guards against duplicate
+    sends within the same day/week using state/last_summary.json."""
+    now = datetime.now(timezone.utc)
+    if now.hour != DAILY_SUMMARY_HOUR:
+        return
+    state = get_summary_state()
+    rows = load_journal()
+
+    today_str = now.strftime("%Y-%m-%d")
+    if state.get("daily") != today_str:
+        todays_rows = [r for r in rows if within_days(r, 1, now)]
+        send_telegram(format_stats_message(f"Daily Summary — {today_str}", todays_rows))
+        state["daily"] = today_str
+        save_summary_state(state)
+
+    if now.weekday() == WEEKLY_SUMMARY_WEEKDAY:
+        week_str = now.strftime("%Y-W%W")
+        if state.get("weekly") != week_str:
+            weekly_rows = [r for r in rows if within_days(r, 7, now)]
+            send_telegram(format_stats_message(f"Weekly Summary — {week_str}", weekly_rows))
+            state["weekly"] = week_str
+            save_summary_state(state)
+
+
+# ---------------------------------------------------------------------------
 # TELEGRAM
 # ---------------------------------------------------------------------------
 
@@ -318,6 +476,8 @@ def poll_commands():
         text = msg.get("text", "").strip()
         if text.startswith("/calc"):
             send_telegram(handle_calc_command(text))
+        elif text.startswith("/outcome"):
+            send_telegram(handle_outcome_command(text))
         elif text.startswith("/start") or text.startswith("/help"):
             send_telegram(HELP_TEXT)
 
@@ -386,94 +546,4 @@ def scan_pair(name, ticker, alerted, stats):
             if in_zone:
                 tapped = True
             if tapped:
-                if direction == "bull" and is_bull_engulf(wprev, wcur):
-                    entry_candle = wcur
-                elif direction == "bear" and is_bear_engulf(wprev, wcur):
-                    entry_candle = wcur
-
-        if entry_candle is None:
-            continue
-
-        entry_time = entry_candle.name
-        if entry_time != df_5m.index[-1]:
-            continue
-
-        key = f"{name}_{direction}_{engulf_time.isoformat()}_{entry_time.isoformat()}"
-        if key in alerted:
-            continue
-
-        entry = entry_candle["Close"]
-        stop = zone_low if direction == "bull" else zone_high
-        risk = abs(entry - stop)
-        if risk == 0:
-            continue
-        target = entry + TARGET_R * risk if direction == "bull" else entry - TARGET_R * risk
-
-        drift_r = abs(live_price - entry) / risk
-        if drift_r > DRIFT_GATE_R:
-            print(f"[{name}] setup found but drift {drift_r:.2f}R exceeds gate, skipping alert")
-            alerted.add(key)
-            continue
-
-        session_tag = "in-session" if in_session else "off-session"
-        arrow = "🟢 BUY" if direction == "bull" else "🔴 SELL"
-        message = (
-            f"*{arrow} — {name}*\n"
-            f"Structure Engulf | {session_tag}\n\n"
-            f"{format_checklist(checks)}\n"
-            f"Retest tapped ✅\n"
-            f"5m confirmation ✅\n"
-            f"Score: {score}/6\n\n"
-            f"Entry: `{entry:.5f}`\n"
-            f"Stop: `{stop:.5f}`\n"
-            f"Target ({TARGET_R}R): `{target:.5f}`\n"
-            f"Live: `{live_price:.5f}`\n\n"
-            f"1H zone: {zone_low:.5f} - {zone_high:.5f}\n"
-            f"Engulf: {engulf_time} UTC\n\n"
-            f"_Reply /calc <account> <risk%> {entry:.5f} {stop:.5f} to size this trade._"
-        )
-        print(f"[{name}] ALERT — {arrow} score {score}/6")
-        send_telegram(message)
-        alerted.add(key)
-        stats["signals"] += 1
-
-    return heartbeat
-
-
-# ---------------------------------------------------------------------------
-# HEARTBEAT
-# ---------------------------------------------------------------------------
-
-def format_heartbeat_line(info):
-    if "status" in info:
-        return f"{info['name']}: {info['status']}"
-    session_tag = "in-session" if info["in_session"] else "off-session"
-    return f"{info['name']}: {info['zones']} zones, 1H trend {info['trend']}, {session_tag}"
-
-
-def send_heartbeat(heartbeats, signal_count):
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"Scanner alive {now_str}. Signals: {signal_count}"]
-    lines += [format_heartbeat_line(h) for h in heartbeats]
-    send_telegram("\n".join(lines))
-
-
-def main():
-    alerted = load_state()
-    stats = {"signals": 0}
-    heartbeats = []
-    for name, ticker in PAIRS.items():
-        try:
-            info = scan_pair(name, ticker, alerted, stats)
-        except Exception as e:
-            print(f"[{name}] error: {e}")
-            info = {"name": name, "status": "error"}
-        heartbeats.append(info)
-    save_state(alerted)
-    send_heartbeat(heartbeats, stats["signals"])
-    poll_commands()
-
-
-if __name__ == "__main__":
-    main()
-  
+                if direction == "bull" and is_b
